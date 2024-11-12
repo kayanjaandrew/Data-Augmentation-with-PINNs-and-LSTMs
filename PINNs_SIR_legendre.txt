@@ -1,0 +1,242 @@
+# Legendre Filter and SIR Model with DeepXDE
+
+!pip install deepxde
+from deepxde.backend.set_default_backend import set_default_backend
+set_default_backend("tensorflow")
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from scipy.interpolate import PchipInterpolator
+from scipy.special import legendre
+import deepxde as dde
+from deepxde.backend import tf
+from google.colab import drive
+
+
+
+def split_data(data_x, data_y, split_ratio=0.85):
+    num_train = int(len(data_x) * split_ratio)
+    return data_x[:num_train], data_y[:num_train], data_x[num_train-1:], data_y[num_train-1:]
+
+def interpolate_data(time_original, data_original, num_points):
+    pchip_interp = PchipInterpolator(time_original, data_original)
+    time_interpolated = []
+    for i in range(len(time_original) - 1):
+        interval_points = np.linspace(time_original[i], time_original[i + 1], num_points // (len(time_original) - 1) + 2)[1:-1]
+        time_interpolated.extend(interval_points)
+    time_interpolated = np.array(time_interpolated)
+    data_interpolated = pchip_interp(time_interpolated)
+    return time_interpolated, data_interpolated
+
+def adaptive_noise(data, window_size, scale_factor, seed):
+    """
+    Generates adaptive Gaussian noise based on local variability in the data.
+
+    Parameters:
+    - data (array-like): The input time series data.
+    - window_size (int): The size of the rolling window to calculate local variability.
+                         Must be odd. If an even number is provided, it is incremented to make it odd.
+    - scale_factor (float): Factor to scale the noise.
+    - seed (int): Random seed for reproducibility.
+
+    Returns:
+    - noisy_data (np.ndarray): The data with adaptive Gaussian noise added.
+    - noise (np.ndarray): The generated noise.
+    - variability (np.ndarray): The local variability used to scale the noise.
+    """
+    # Set random seed
+    np.random.seed(seed)
+
+    # Calculate local variability using rolling window
+    variability = pd.Series(data).rolling(window=window_size, min_periods=1, center=True).std().fillna(0).values
+
+    # Add a small constant to avoid zero variability
+    variability += 1e-6
+
+    #The code currently uses Gaussian noise with mean 0 and standard deviation based on the variability.
+    #This may not always be appropriate for all time series, especially if the data has non-Gaussian distributions.
+     #You could explore other noise distributions (e.g., Laplace noise) depending on your data's characteristics.
+    # Generate Gaussian noise based on local variability and scale it
+    noise = np.random.normal(loc=0.0, scale=variability) * scale_factor
+
+    # Apply noise to data
+    noisy_data = data + noise
+
+    return noisy_data
+
+def legendre_filter(data, window_length, order):
+    if window_length % 2 == 0:
+        window_length += 1
+    half_window = window_length // 2
+    x = np.linspace(-1, 1, window_length)
+    basis = np.array([legendre(i)(x) for i in range(order + 1)])
+    smoothed_data = np.zeros_like(data)
+    for i in range(len(data)):
+        start = max(0, i - half_window)
+        end = min(len(data), i + half_window + 1)
+        window = data[start:end]
+        if len(window) < window_length:
+            pad_left = max(0, half_window - i)
+            pad_right = max(0, i + half_window + 1 - len(data))
+            window = np.pad(window, (pad_left, pad_right), mode='edge')
+        coeffs = np.linalg.lstsq(basis.T, window, rcond=None)[0]
+        smoothed_data[i] = np.dot(coeffs, basis[:, half_window])
+    return smoothed_data
+
+def combine_and_sort(time_original, data_original, time_interpolated, data_smoothed):
+    time_combined = np.concatenate((time_original, time_interpolated))
+    data_combined = np.concatenate((data_original, data_smoothed))
+    sorted_indices = np.argsort(time_combined)
+    return time_combined[sorted_indices], data_combined[sorted_indices]
+
+def sir_model(t, y):
+    """SIR model system of ODEs."""
+    S, I, R = y[:, 0:1], y[:, 1:2], y[:, 2:]
+
+    # Unpack parameters (use tanh to ensure positivity)
+    beta = (tf.tanh(beta_) + 1) * 0.4
+    gamma = (tf.tanh(gamma_) + 1) * 0.3
+
+    # Total population N
+    N = 738.0
+
+    dS_dt = dde.grad.jacobian(y, t, i=0)
+    dI_dt = dde.grad.jacobian(y, t, i=1)
+    dR_dt = dde.grad.jacobian(y, t, i=2)
+
+    equations = [
+        dS_dt - (-beta * S * I / N),
+        dI_dt - (beta * S * I / N - gamma * I),
+        dR_dt - (gamma * I)
+    ]
+
+    return equations
+
+class LossMonitor(dde.callbacks.Callback):
+    def __init__(self):
+        super().__init__()
+        self.losses = []
+
+    def on_epoch_end(self):
+        loss_values = self.model.train_state.loss_train
+        self.losses.append(loss_values)
+
+def create_and_train_model(train_t, train_y, test_t, test_y):
+    # Debugging: Print shapes
+    print(f"Training data shapes - train_t: {train_t.shape}, train_y: {train_y.shape}")
+
+    # Set the time domain based on the data provided
+    geom = dde.geometry.TimeDomain(np.min(train_t), np.max(train_t))
+
+    # Initial conditions
+    def boundary(_, on_initial):
+        return on_initial
+
+    # Ensure components match the size of your data
+    ic1 = dde.icbc.IC(geom, lambda X: 738.0, boundary, component=0)
+    ic2 = dde.icbc.IC(geom, lambda X: 1.0, boundary, component=1)
+    ic3 = dde.icbc.IC(geom, lambda X: 0.0, boundary, component=2)
+
+    # Observe data
+    observe_y = dde.PointSetBC(train_t, train_y, component=1)
+    observe_t = train_t
+
+    data = dde.data.PDE(
+        geom,
+        sir_model,
+        [ic1, ic2, ic3, observe_y],
+        num_domain=500,
+        num_boundary=2,
+
+    )
+
+    net = dde.nn.FNN([1] + [128] * 3 + [3], "swish", "Glorot normal")
+
+    max_value_t = np.max(train_t)
+
+    def feature_transform(t):
+        return t / max_value_t
+
+    net.apply_feature_transform(feature_transform)
+
+    model = dde.Model(data, net)
+
+    # Initialize the weights for [ode residual,IC1,IC2,IC3, Data] =
+    manual_weights = [1.0, 0.01, 0.1, 0.01,1.0, 1.0, 0.1]
+
+    model.compile("adam", lr=1e-3, loss_weights=manual_weights)
+
+    loss_monitor = LossMonitor()  # Initialize the loss monitor
+
+    # Train the model with the loss monitor callback
+    losshistory, train_state = model.train(
+        epochs=40000,
+        display_every=1000,
+        callbacks=[loss_monitor]
+    )
+
+    return model
+
+def calculate_rmse(y_true, y_pred):
+    return np.sqrt(np.mean((y_true - y_pred)**2))
+
+# Initialize data
+data_y = np.array([25, 75, 227, 296, 258, 236, 192, 126, 71, 28, 11, 7])
+data_t = np.array([3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
+
+# Initialize global variables
+beta_ = dde.Variable(0.0)
+gamma_ = dde.Variable(0.0)
+
+# Run the model multiple times and average the results
+num_runs = 1
+train_preds = []
+test_preds = []
+
+for _ in range(num_runs):
+    # Split data
+    train_t, train_y, test_t, test_y = split_data(data_t, data_y)
+
+    # Data augmentation
+    n_samples = 9 + 8 * 20 - len(train_t)
+    time_interpolated, data_interpolated = interpolate_data(train_t, train_y, n_samples)
+    data_interpolated_with_noise = adaptive_noise(data_interpolated, window_size=3, scale_factor=0.1,seed=53)
+    data_smoothed = legendre_filter(data_interpolated_with_noise, window_length=3, order=2)
+    time_combined, data_combined = combine_and_sort(train_t, train_y, time_interpolated, data_smoothed)
+
+    # Reshape data
+    train_t = np.array(time_combined).reshape(-1, 1)
+    train_y = np.array(data_combined).reshape(-1, 1)
+
+    # Create and train model
+    model = create_and_train_model(train_t, train_y, test_t, test_y)
+
+    # Predict
+    train_pred = model.predict(train_t)[:, 1]
+    test_pred = model.predict(test_t.reshape(-1, 1))[:, 1]
+
+    train_preds.append(train_pred)
+    test_preds.append(test_pred)
+
+# Average predictions
+avg_train_pred = np.mean(train_preds, axis=0)
+avg_test_pred = np.mean(test_preds, axis=0)
+
+# Calculate RMSE
+train_rmse = calculate_rmse(train_y, avg_train_pred)
+test_rmse = calculate_rmse(test_y, avg_test_pred)
+
+print(f"Average Training RMSE: {train_rmse}")
+print(f"Average Test RMSE: {test_rmse}")
+
+# Plot results
+plt.figure(figsize=(12, 8))
+plt.plot(train_t, train_y, 'o', label='Training Data', markersize=4)
+plt.plot(test_t, test_y, 'o', label='Test Data', markersize=4)
+plt.plot(train_t, avg_train_pred, '-', label='Model Prediction (Train)', linewidth=2)
+plt.plot(test_t, avg_test_pred, '-', label='Model Prediction (Test)', linewidth=2)
+plt.xlabel("Time (Days)", fontsize=12, fontweight='bold')
+plt.ylabel("$\mathbf{I_2}$", fontsize=12)
+plt.legend(loc='best')
+
